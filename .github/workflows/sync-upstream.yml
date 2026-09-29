@@ -1,0 +1,122 @@
+name: Sync upstream
+
+# 把上游 ddddx/teleagent2api 的更新合并进本 fork 的 main。
+# 触发：每天定时检查一次 + 需要时手动运行（可 dry-run 只看不推）。
+
+on:
+  schedule:
+    # 每天 03:00 UTC = 北京时间 11:00
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只检查上游是否有更新，不推送"
+        type: boolean
+        default: false
+
+# contents:write 用于 push；actions:write 用于同步完成后主动触发 docker.yml
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ddddx/teleagent2api
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          # 需要完整历史才能做 merge-base / merge
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and compare
+        id: check
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          # 用 FETCH_HEAD 而非 upstream/main，少依赖一个远端跟踪引用
+          UPSTREAM_SHA="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "上游 ${UPSTREAM_SHA:0:8} / 本地 ${LOCAL_SHA:0:8}"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$LOCAL_SHA"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Sync upstream"
+              echo ""
+              echo "上游无新提交，fork 已是最新（\`${LOCAL_SHA:0:8}\`）。"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Sync upstream"
+              echo ""
+              echo "上游有新提交："
+              echo ""
+              echo '```'
+              git log --oneline --no-decorate "${LOCAL_SHA}..${UPSTREAM_SHA}" | head -20 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          # 能快进就快进；fork 有本地改动时产生一个 merge commit
+          if ! git merge -m "Merge upstream ${UPSTREAM_REPO}@${UPSTREAM_SHA:0:8}" "$UPSTREAM_SHA"; then
+            echo "::error title=合并冲突::上游改动与 fork 的本地改动冲突，需手动处理后再同步"
+            echo "冲突文件："
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          fi
+          echo "merged_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push to fork
+        if: steps.check.outputs.changed == 'true' && inputs.dry_run != true
+        run: |
+          git push origin "HEAD:${FORK_BRANCH}"
+          {
+            echo ""
+            echo "已推送到 \`${FORK_BRANCH}\`（\`${merged_sha}\`）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 用 GITHUB_TOKEN 推送产生的 push 事件不会触发下游 workflow，
+      # 所以这里显式 dispatch（workflow_dispatch 是官方允许的例外）。
+      - name: Trigger docker build
+        if: steps.check.outputs.changed == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "${FORK_BRANCH}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "已触发 docker.yml 构建镜像。" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run notice
+        if: inputs.dry_run == true
+        run: echo "dry_run 已开启，未推送、未触发构建。" >> "$GITHUB_STEP_SUMMARY"
